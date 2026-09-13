@@ -23,6 +23,9 @@ lens_kcube / lens_circle_* radial-distortion attributes.
 Requires a running CARLA server, e.g.:
     packages/CALRA/CarlaUE4.sh
 
+Each camera is encoded straight to an MP4 (no intermediate PNG frames) at
+output_dir/<camera_name>.mp4.
+
 Usage:
     python3 multi_camera_demo.py --town Town05 --num-vehicles 20 \
         --output-dir _out --duration 30
@@ -35,6 +38,8 @@ import time
 from pathlib import Path
 
 import carla
+import cv2
+import numpy as np
 
 from autonomous_driving_demo import (
     BehaviorAgent,
@@ -149,26 +154,39 @@ def build_camera_blueprint(blueprint_library, spec, sensor_tick):
     return bp
 
 
-def spawn_camera_rig(world, blueprint_library, ego_vehicle, output_dir, sensor_tick):
-    """Attaches all 11 cameras to the ego vehicle. Each camera writes its
-    frames to output_dir/<camera_name>/%08d.png via its own listen callback."""
+def image_to_bgr_array(image):
+    """CARLA delivers raw_data as a flat BGRA buffer; drop the alpha channel
+    to get the BGR layout cv2.VideoWriter expects."""
+    array = np.frombuffer(image.raw_data, dtype=np.uint8)
+    array = array.reshape((image.height, image.width, 4))
+    return array[:, :, :3]
+
+
+def spawn_camera_rig(world, blueprint_library, ego_vehicle, output_dir, sensor_tick, fps):
+    """Attaches all 11 cameras to the ego vehicle. Each camera encodes its
+    frames directly to output_dir/<camera_name>.mp4 via its own listen
+    callback, so no PNG frames ever hit disk."""
     cameras = []
+    writers = []
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     for spec in CAMERA_RIG:
         bp = build_camera_blueprint(blueprint_library, spec, sensor_tick)
         camera = world.spawn_actor(bp, spec["transform"], attach_to=ego_vehicle)
-        camera_output_dir = output_dir / spec["name"]
-        camera_output_dir.mkdir(parents=True, exist_ok=True)
+        video_path = output_dir / f"{spec['name']}.mp4"
+        writer = cv2.VideoWriter(str(video_path), fourcc, fps, (spec["width"], spec["height"]))
 
-        def make_callback(save_dir):
+        def make_callback(video_writer):
             def callback(image):
-                image.save_to_disk(str(save_dir / f"{image.frame:08d}.png"))
+                video_writer.write(image_to_bgr_array(image))
             return callback
 
-        camera.listen(make_callback(camera_output_dir))
+        camera.listen(make_callback(writer))
         cameras.append(camera)
+        writers.append(writer)
         print(f"  camera '{spec['name']}' attached (fov={spec['fov']}, "
-              f"{spec['width']}x{spec['height']}{', fisheye' if spec.get('fisheye') else ''})")
-    return cameras
+              f"{spec['width']}x{spec['height']}{', fisheye' if spec.get('fisheye') else ''}) "
+              f"-> {video_path}")
+    return cameras, writers
 
 
 def main():
@@ -225,6 +243,7 @@ def main():
     ego_vehicle = None
     background_vehicles = []
     cameras = []
+    writers = []
 
     try:
         ego_vehicle, ego_spawn_point = spawn_ego_vehicle(world, blueprint_library, available_spawn_points)
@@ -238,8 +257,11 @@ def main():
         for vehicle in background_vehicles:
             vehicle.set_autopilot(True, traffic_manager.get_port())
 
-        print(f"Attaching {len(CAMERA_RIG)}-camera rig, saving frames under '{output_dir}/':")
-        cameras = spawn_camera_rig(world, blueprint_library, ego_vehicle, output_dir, args.sensor_tick)
+        fps = (1.0 / args.sensor_tick) if args.sensor_tick > 0 else (1.0 / fixed_delta_seconds)
+        print(f"Attaching {len(CAMERA_RIG)}-camera rig, encoding video under '{output_dir}/' at {fps:.1f} fps:")
+        cameras, writers = spawn_camera_rig(
+            world, blueprint_library, ego_vehicle, output_dir, args.sensor_tick, fps
+        )
 
         agent = BehaviorAgent(ego_vehicle, behavior=args.behavior)
         destination = pick_destination(spawn_points, ego_spawn_point.location)
@@ -270,11 +292,11 @@ def main():
         print("\nStopping simulation.")
     finally:
         print("Cleaning up actors and restoring world settings...")
-        # Each camera's listen() callback (including its save_to_disk write)
+        # Each camera's listen() callback (including its VideoWriter.write)
         # runs on a background thread that trails the simulation by up to
         # one frame. Stop the cameras, then give that last in-flight
-        # callback time to finish writing before destroying the actors --
-        # otherwise the final frame on disk can end up truncated.
+        # callback time to finish before releasing the writers -- otherwise
+        # the last frame or two can end up missing from the video.
         for camera in cameras:
             if camera.is_alive:
                 camera.stop()
@@ -282,6 +304,8 @@ def main():
         for camera in cameras:
             if camera.is_alive:
                 camera.destroy()
+        for writer in writers:
+            writer.release()
 
         traffic_manager.set_synchronous_mode(False)
         settings.synchronous_mode = original_sync_mode
