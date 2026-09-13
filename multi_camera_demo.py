@@ -24,11 +24,16 @@ Requires a running CARLA server, e.g.:
     packages/CALRA/CarlaUE4.sh
 
 Each camera is encoded straight to an MP4 (no intermediate PNG frames) at
-output_dir/<camera_name>.mp4. A 12th "main_view" chase camera (the normal
-third-person view of the car driving) is also recorded on its own, and all
-12 feeds are combined into output_dir/combined_demo.mp4: the chase view in
-the middle, the 11 rig cameras arranged around it to match where they sit
-on the car.
+output_dir/<camera_name>_<timestamp>.mp4. Two extra views are recorded the
+same way: "main_view", a chase camera behind the car (the normal
+third-person view of it driving), and "birdseye", a top-down camera
+mirroring CARLA's default spectator behavior (straight down, following the
+car). All 13 feeds are combined into output_dir/combined_demo_<timestamp>.mp4
+as two side-by-side panels:
+  - left:  main_view in the middle, surrounded by the 7 non-fisheye rig
+           cameras (front_near/front_far/rear_mid/left_front/right_front/
+           left_rear/right_rear).
+  - right: birdseye in the middle, surrounded by the 4 fisheye cameras.
 
 Usage:
     python3 multi_camera_demo.py --town Town05 --num-vehicles 20 \
@@ -155,27 +160,42 @@ MAIN_VIEW_CAMERA = dict(
     height=720,
 )
 
-# Placement of the 11 rig cameras around the combined video's border, in a
-# (row, col) grid that mirrors where each camera actually sits on the car:
-# front cameras on top, rear on the bottom, left/right on their own side.
-# The chase view fills the untouched rows 1-2 / cols 1-3 in the middle.
-COMPOSITE_ROWS, COMPOSITE_COLS = 4, 5
-COMPOSITE_CENTER_ROWS = (1, 3)  # rows [1, 3)
-COMPOSITE_CENTER_COLS = (1, 4)  # cols [1, 4)
-COMPOSITE_CELL_SIZE = (320, 240)  # (width, height) of one border tile
-COMPOSITE_GRID_LAYOUT = {
-    (0, 0): "left_front",
-    (0, 1): "front_far",
-    (0, 2): "front_near",
-    (0, 3): "fisheye_front",
-    (0, 4): "right_front",
-    (1, 0): "fisheye_left",
-    (2, 0): "left_rear",
-    (1, 4): "fisheye_right",
-    (2, 4): "right_rear",
-    (3, 1): "rear_mid",
-    (3, 2): "fisheye_rear",
-}
+# The other combined-video center view: CARLA's default top-down spectator
+# look (straight down, 25m up), mirroring move_spectator_to() below. Unlike
+# every other camera here it is NOT attached to the vehicle -- attaching
+# would make it spin with the car's heading -- it's a free-floating actor
+# whose transform gets updated every tick from birdseye_transform().
+BIRDSEYE_CAMERA = dict(
+    name="birdseye",
+    fov=90,
+    width=720,
+    height=540,
+)
+
+# ---------------------------------------------------------------------------
+# Combined demo video layout: two side-by-side panels.
+#   left panel  = main_view in the middle, ringed by the 7 non-fisheye rig
+#                 cameras (front row / rear row / diagonal corners).
+#   right panel = birdseye in the middle, ringed by the 4 fisheye cameras
+#                 at N/E/S/W.
+# All sizes are (width, height) in pixels; layout is built from explicit
+# pixel rects rather than a uniform grid since the two panels don't share
+# the same column count.
+LEFT_TILE_SIZE = (240, 180)
+LEFT_TOP_ROW = ["left_front", "front_far", "front_near", "right_front"]
+LEFT_BOTTOM_ROW = ["left_rear", "rear_mid", None, "right_rear"]
+LEFT_CENTER_SIZE = (LEFT_TILE_SIZE[0] * len(LEFT_TOP_ROW), 540)  # 960x540, matches main_view's 16:9
+LEFT_PANEL_SIZE = (LEFT_CENTER_SIZE[0], LEFT_TILE_SIZE[1] * 2 + LEFT_CENTER_SIZE[1])  # 960x900
+
+RIGHT_SIDE_TILE_SIZE = (240, 540)  # fisheye_left / fisheye_right
+RIGHT_TOPBOTTOM_TILE_SIZE = (720, 180)  # fisheye_front / fisheye_rear
+RIGHT_CENTER_SIZE = (720, 540)  # birdseye, matches BIRDSEYE_CAMERA's native size 1:1 (no resize)
+RIGHT_PANEL_SIZE = (
+    RIGHT_SIDE_TILE_SIZE[0] * 2 + RIGHT_CENTER_SIZE[0],
+    RIGHT_TOPBOTTOM_TILE_SIZE[1] * 2 + RIGHT_CENTER_SIZE[1],
+)  # 1200x900
+
+assert LEFT_PANEL_SIZE[1] == RIGHT_PANEL_SIZE[1], "left/right panels must have equal height to sit side by side"
 
 
 def build_camera_blueprint(blueprint_library, spec, sensor_tick):
@@ -205,54 +225,72 @@ def _draw_label(tile, text):
     cv2.putText(tile, text, (4, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
 
-class CompositeRecorder:
-    """Builds output_dir/combined_demo.mp4: the main_view chase camera in
-    the middle, the 11 rig cameras tiled around it to match where they
-    physically sit on the car (COMPOSITE_GRID_LAYOUT).
+def _place_tile(canvas, frame, label, x, y, size):
+    """Resizes frame to size=(w, h) and stamps it into canvas at (x, y).
+    Leaves the background (and label) alone if frame hasn't arrived yet."""
+    if frame is None:
+        return
+    w, h = size
+    tile = cv2.resize(frame, (w, h))
+    _draw_label(tile, label)
+    canvas[y:y + h, x:x + w] = tile
 
-    Side-camera frames arrive on their own sensor threads and generally
-    aren't in lockstep with main_view, so each one just updates a "latest
-    frame" cache; the combined frame is assembled and written every time a
-    fresh main_view frame arrives, using whatever is currently cached for
-    the rest (at most one capture interval stale).
+
+class CompositeRecorder:
+    """Builds output_dir/combined_demo_<timestamp>.mp4 as two side-by-side
+    panels (see the LEFT_*/RIGHT_* layout constants above):
+      - left:  main_view in the middle, ringed by the 7 non-fisheye cameras.
+      - right: birdseye in the middle, ringed by the 4 fisheye cameras.
+
+    Every camera's frame just updates a "latest frame" cache as it arrives
+    (they run on independent sensor threads, generally not in lockstep);
+    the combined frame is assembled and written every time a fresh
+    main_view frame arrives (notify_main), using whatever is currently
+    cached for everything else (at most one capture interval stale).
     """
 
     def __init__(self, output_dir, fps, timestamp):
-        cell_w, cell_h = COMPOSITE_CELL_SIZE
-        canvas_size = (COMPOSITE_COLS * cell_w, COMPOSITE_ROWS * cell_h)
+        canvas_w = LEFT_PANEL_SIZE[0] + RIGHT_PANEL_SIZE[0]
+        canvas_h = LEFT_PANEL_SIZE[1]
+        self.canvas_size = (canvas_w, canvas_h)
         self.lock = threading.Lock()
         self.latest_frames = {}
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         video_path = output_dir / f"combined_demo_{timestamp}.mp4"
-        self.writer = cv2.VideoWriter(str(video_path), fourcc, fps, canvas_size)
-        print(f"  combined demo video -> {video_path} ({canvas_size[0]}x{canvas_size[1]})")
+        self.writer = cv2.VideoWriter(str(video_path), fourcc, fps, self.canvas_size)
+        print(f"  combined demo video -> {video_path} ({canvas_w}x{canvas_h})")
 
     def update(self, name, bgr_array):
         with self.lock:
             self.latest_frames[name] = bgr_array
 
-    def render_on(self, main_bgr_array):
-        cell_w, cell_h = COMPOSITE_CELL_SIZE
-        canvas = np.full((COMPOSITE_ROWS * cell_h, COMPOSITE_COLS * cell_w, 3), 30, dtype=np.uint8)
+    def notify_main(self, main_bgr_array):
+        self.update("main_view", main_bgr_array)
+        self._render()
 
+    def _render(self):
+        canvas_w, canvas_h = self.canvas_size
+        canvas = np.full((canvas_h, canvas_w, 3), 30, dtype=np.uint8)
         with self.lock:
             frames = dict(self.latest_frames)
-        for (row, col), name in COMPOSITE_GRID_LAYOUT.items():
-            frame = frames.get(name)
-            if frame is None:
-                continue
-            tile = cv2.resize(frame, COMPOSITE_CELL_SIZE)
-            _draw_label(tile, name)
-            y0, x0 = row * cell_h, col * cell_w
-            canvas[y0:y0 + cell_h, x0:x0 + cell_w] = tile
 
-        center_w = (COMPOSITE_CENTER_COLS[1] - COMPOSITE_CENTER_COLS[0]) * cell_w
-        center_h = (COMPOSITE_CENTER_ROWS[1] - COMPOSITE_CENTER_ROWS[0]) * cell_h
-        center_tile = cv2.resize(main_bgr_array, (center_w, center_h))
-        _draw_label(center_tile, "main_view")
-        y0 = COMPOSITE_CENTER_ROWS[0] * cell_h
-        x0 = COMPOSITE_CENTER_COLS[0] * cell_w
-        canvas[y0:y0 + center_h, x0:x0 + center_w] = center_tile
+        tw, th = LEFT_TILE_SIZE
+        for col, name in enumerate(LEFT_TOP_ROW):
+            _place_tile(canvas, frames.get(name), name, col * tw, 0, LEFT_TILE_SIZE)
+        _place_tile(canvas, frames.get("main_view"), "main_view", 0, th, LEFT_CENTER_SIZE)
+        for col, name in enumerate(LEFT_BOTTOM_ROW):
+            if name is not None:
+                _place_tile(canvas, frames.get(name), name, col * tw, th + LEFT_CENTER_SIZE[1], LEFT_TILE_SIZE)
+
+        x_off = LEFT_PANEL_SIZE[0]
+        sw, sh = RIGHT_SIDE_TILE_SIZE
+        tbw, tbh = RIGHT_TOPBOTTOM_TILE_SIZE
+        cw, ch = RIGHT_CENTER_SIZE
+        _place_tile(canvas, frames.get("fisheye_front"), "fisheye_front", x_off + sw, 0, RIGHT_TOPBOTTOM_TILE_SIZE)
+        _place_tile(canvas, frames.get("fisheye_left"), "fisheye_left", x_off, tbh, RIGHT_SIDE_TILE_SIZE)
+        _place_tile(canvas, frames.get("birdseye"), "birdseye", x_off + sw, tbh, RIGHT_CENTER_SIZE)
+        _place_tile(canvas, frames.get("fisheye_right"), "fisheye_right", x_off + sw + cw, tbh, RIGHT_SIDE_TILE_SIZE)
+        _place_tile(canvas, frames.get("fisheye_rear"), "fisheye_rear", x_off + sw, tbh + ch, RIGHT_TOPBOTTOM_TILE_SIZE)
 
         self.writer.write(canvas)
 
@@ -303,7 +341,38 @@ def spawn_main_view_camera(world, blueprint_library, ego_vehicle, output_dir, se
     def callback(image):
         frame = image_to_bgr_array(image)
         writer.write(frame)
-        composite.render_on(frame)
+        composite.notify_main(frame)
+
+    camera.listen(callback)
+    print(f"  camera '{spec['name']}' attached (fov={spec['fov']}, "
+          f"{spec['width']}x{spec['height']}) -> {video_path}")
+    return camera, writer
+
+
+def birdseye_transform(vehicle_transform):
+    """Same framing as move_spectator_to() in autonomous_driving_demo.py:
+    straight down from 25m up, not rotated with the vehicle's heading."""
+    return carla.Transform(
+        vehicle_transform.location + carla.Location(z=25),
+        carla.Rotation(pitch=-90),
+    )
+
+
+def spawn_birdseye_camera(world, blueprint_library, ego_vehicle, output_dir, sensor_tick, fps, composite, timestamp):
+    """Spawns the top-down birdseye camera as a free-floating actor (not
+    attached to the vehicle, so it doesn't spin with its heading). Callers
+    must reposition it every tick via birdseye_transform(); see main()."""
+    spec = BIRDSEYE_CAMERA
+    bp = build_camera_blueprint(blueprint_library, spec, sensor_tick)
+    camera = world.spawn_actor(bp, birdseye_transform(ego_vehicle.get_transform()))
+    video_path = output_dir / f"{spec['name']}_{timestamp}.mp4"
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(video_path), fourcc, fps, (spec["width"], spec["height"]))
+
+    def callback(image):
+        frame = image_to_bgr_array(image)
+        writer.write(frame)
+        composite.update(spec["name"], frame)
 
     camera.listen(callback)
     print(f"  camera '{spec['name']}' attached (fov={spec['fov']}, "
@@ -388,8 +457,8 @@ def main():
             vehicle.set_autopilot(True, traffic_manager.get_port())
 
         fps = (1.0 / args.sensor_tick) if args.sensor_tick > 0 else (1.0 / fixed_delta_seconds)
-        print(f"Attaching {len(CAMERA_RIG)}-camera rig + main view, encoding video under "
-              f"'{output_dir}/' at {fps:.1f} fps:")
+        print(f"Attaching {len(CAMERA_RIG)}-camera rig + main_view + birdseye, encoding video "
+              f"under '{output_dir}/' at {fps:.1f} fps:")
         composite = CompositeRecorder(output_dir, fps, timestamp)
         cameras, writers = spawn_camera_rig(
             world, blueprint_library, ego_vehicle, output_dir, args.sensor_tick, fps, composite, timestamp
@@ -397,8 +466,13 @@ def main():
         main_camera, main_writer = spawn_main_view_camera(
             world, blueprint_library, ego_vehicle, output_dir, args.sensor_tick, fps, composite, timestamp
         )
+        birdseye_camera, birdseye_writer = spawn_birdseye_camera(
+            world, blueprint_library, ego_vehicle, output_dir, args.sensor_tick, fps, composite, timestamp
+        )
         cameras.append(main_camera)
         writers.append(main_writer)
+        cameras.append(birdseye_camera)
+        writers.append(birdseye_writer)
 
         agent = BehaviorAgent(ego_vehicle, behavior=args.behavior)
         destination = pick_destination(spawn_points, ego_spawn_point.location)
@@ -424,6 +498,8 @@ def main():
             ego_vehicle.apply_control(control)
 
             move_spectator_to(world, ego_vehicle.get_transform())
+            if birdseye_camera.is_alive:
+                birdseye_camera.set_transform(birdseye_transform(ego_vehicle.get_transform()))
 
     except KeyboardInterrupt:
         print("\nStopping simulation.")
