@@ -217,13 +217,13 @@ class CompositeRecorder:
     the rest (at most one capture interval stale).
     """
 
-    def __init__(self, output_dir, fps):
+    def __init__(self, output_dir, fps, timestamp):
         cell_w, cell_h = COMPOSITE_CELL_SIZE
         canvas_size = (COMPOSITE_COLS * cell_w, COMPOSITE_ROWS * cell_h)
         self.lock = threading.Lock()
         self.latest_frames = {}
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        video_path = output_dir / "combined_demo.mp4"
+        video_path = output_dir / f"combined_demo_{timestamp}.mp4"
         self.writer = cv2.VideoWriter(str(video_path), fourcc, fps, canvas_size)
         print(f"  combined demo video -> {video_path} ({canvas_size[0]}x{canvas_size[1]})")
 
@@ -260,18 +260,18 @@ class CompositeRecorder:
         self.writer.release()
 
 
-def spawn_camera_rig(world, blueprint_library, ego_vehicle, output_dir, sensor_tick, fps, composite):
+def spawn_camera_rig(world, blueprint_library, ego_vehicle, output_dir, sensor_tick, fps, composite, timestamp):
     """Attaches all 11 rig cameras to the ego vehicle. Each camera encodes
-    its frames directly to output_dir/<camera_name>.mp4 via its own listen
-    callback (no PNG frames ever hit disk), and also feeds its latest frame
-    to `composite` for the combined demo video."""
+    its frames directly to output_dir/<camera_name>_<timestamp>.mp4 via its
+    own listen callback (no PNG frames ever hit disk), and also feeds its
+    latest frame to `composite` for the combined demo video."""
     cameras = []
     writers = []
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     for spec in CAMERA_RIG:
         bp = build_camera_blueprint(blueprint_library, spec, sensor_tick)
         camera = world.spawn_actor(bp, spec["transform"], attach_to=ego_vehicle)
-        video_path = output_dir / f"{spec['name']}.mp4"
+        video_path = output_dir / f"{spec['name']}_{timestamp}.mp4"
         writer = cv2.VideoWriter(str(video_path), fourcc, fps, (spec["width"], spec["height"]))
 
         def make_callback(video_writer, name):
@@ -290,13 +290,13 @@ def spawn_camera_rig(world, blueprint_library, ego_vehicle, output_dir, sensor_t
     return cameras, writers
 
 
-def spawn_main_view_camera(world, blueprint_library, ego_vehicle, output_dir, sensor_tick, fps, composite):
+def spawn_main_view_camera(world, blueprint_library, ego_vehicle, output_dir, sensor_tick, fps, composite, timestamp):
     """Attaches the chase-view camera and wires it to drive `composite`'s
     combined-frame assembly (see CompositeRecorder)."""
     spec = MAIN_VIEW_CAMERA
     bp = build_camera_blueprint(blueprint_library, spec, sensor_tick)
     camera = world.spawn_actor(bp, spec["transform"], attach_to=ego_vehicle)
-    video_path = output_dir / f"{spec['name']}.mp4"
+    video_path = output_dir / f"{spec['name']}_{timestamp}.mp4"
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(video_path), fourcc, fps, (spec["width"], spec["height"]))
 
@@ -323,7 +323,13 @@ def main():
         default="normal",
         help="ego vehicle driving style",
     )
-    parser.add_argument("--output-dir", default="_out", help="directory to write camera frames to")
+    parser.add_argument(
+        "--output-dir",
+        default="_out",
+        help="base directory to write recordings to; each run gets its own "
+        "<output-dir>/<YYYYmmdd_HHMMSS>/ subfolder, and every video file "
+        "name carries that same timestamp as a suffix",
+    )
     parser.add_argument(
         "--sensor-tick",
         type=float,
@@ -338,7 +344,8 @@ def main():
     )
     args = parser.parse_args()
 
-    output_dir = Path(args.output_dir)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    output_dir = Path(args.output_dir) / timestamp
     output_dir.mkdir(parents=True, exist_ok=True)
 
     client = carla.Client(args.host, args.port)
@@ -383,12 +390,12 @@ def main():
         fps = (1.0 / args.sensor_tick) if args.sensor_tick > 0 else (1.0 / fixed_delta_seconds)
         print(f"Attaching {len(CAMERA_RIG)}-camera rig + main view, encoding video under "
               f"'{output_dir}/' at {fps:.1f} fps:")
-        composite = CompositeRecorder(output_dir, fps)
+        composite = CompositeRecorder(output_dir, fps, timestamp)
         cameras, writers = spawn_camera_rig(
-            world, blueprint_library, ego_vehicle, output_dir, args.sensor_tick, fps, composite
+            world, blueprint_library, ego_vehicle, output_dir, args.sensor_tick, fps, composite, timestamp
         )
         main_camera, main_writer = spawn_main_view_camera(
-            world, blueprint_library, ego_vehicle, output_dir, args.sensor_tick, fps, composite
+            world, blueprint_library, ego_vehicle, output_dir, args.sensor_tick, fps, composite, timestamp
         )
         cameras.append(main_camera)
         writers.append(main_writer)
